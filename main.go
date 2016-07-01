@@ -10,7 +10,7 @@ import (
 	"unsafe"
 )
 
-var blockCipher cipher.Block
+var blockCipher *cipher.Block
 
 func main() {
 	if len(os.Args) != 2 {
