@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/aes"
 	"log"
 	"net"
 	"os"
 	"syscall"
 	"unsafe"
 )
+
+var blockCipher cipher.Block
 
 func main() {
 	if len(os.Args) != 2 {
@@ -24,6 +27,9 @@ func main() {
 	if len(cfg.Dev) >= len(ifr.name) {
 		log.Fatalf("Device name %s is too long.", cfg.Dev)
 	}
+
+	blockCipher, err = aes.NewCipher([]byte(cfg.Key))
+	checkErr(err)
 
 	copy(ifr.name[:], cfg.Dev)
 	ifr.flags = IFF_TUN | IFF_NO_PI

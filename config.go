@@ -15,6 +15,7 @@ type config struct {
 	Src    string // Source address
 	Dst    string // Destination address
 	MaxPay int    // Maximum payload size.
+	Key    string // 16, 24 or 32 chars
 }
 
 func readConfig(filename string) (*config, error) {
@@ -54,8 +55,8 @@ func readConfig(filename string) (*config, error) {
 		}
 		return nil, err
 	}
-	if cfg.MaxPay < 1 {
-		return nil, errors.New("MaxPayload < 1")
+	if cfg.MaxPay <= 0 {
+		return nil, errors.New("MaxPay <= 0")
 	}
 	return &cfg, nil
 }
