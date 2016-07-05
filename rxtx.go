@@ -1,11 +1,13 @@
 package main
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"io"
 	"log"
 	"net"
 	"os"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -24,35 +26,32 @@ func checkNetErr(err error) bool {
 	panic(nil)
 }
 
-const headerLen = 8 + 1 + 1 + 2
-
 type header struct {
-	Id      uint64 // Schould have a random initial value.
+	Id      uint32 // Schould have a random initial value.
 	FragN   byte
 	FragNum byte
 	Len     uint16
 }
 
+const headerLen = 8
+
 func (h *header) Encode(buf []byte) {
 	id := h.Id
-	for i := 0; i < 8; i++ {
-		buf[i] = byte(id & 0xff)
-		id >>= 8
-	}
-	buf[8] = h.FragN
-	buf[9] = h.FragNum
-	buf[10] = byte(h.Len & 0xff)
-	buf[11] = byte(h.Len >> 8)
+	buf[0] = byte(id)
+	buf[1] = byte(id >> 8)
+	buf[2] = byte(id >> 16)
+	buf[3] = byte(id >> 24)
+	buf[4] = h.FragN
+	buf[5] = h.FragNum
+	buf[6] = byte(h.Len & 0xff)
+	buf[7] = byte(h.Len >> 8)
 }
 
 func (h *header) Decode(buf []byte) {
-	for i := 7; i >= 0; i-- {
-		h.Id <<= 8
-		h.Id |= uint64(buf[i])
-	}
-	h.FragN = buf[8]
-	h.FragNum = buf[9]
-	h.Len = uint16(buf[10]) | uint16(buf[11])<<8
+	h.Id = uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24
+	h.FragN = buf[4]
+	h.FragNum = buf[5]
+	h.Len = uint16(buf[6]) | uint16(buf[7])<<8
 }
 
 func blkAlignUp(n int) int {
@@ -61,12 +60,12 @@ func blkAlignUp(n int) int {
 
 func tunRead(tun io.Reader, con io.Writer, cfg *config) {
 	buffer := make([]byte, 8192)
+	var h header
+
+	// Initialize h.Id to random number.
 	_, err := rand.Read(buffer[:8])
 	checkErr(err)
-	var h header
-	for _, b := range buffer[:8] {
-		h.Id = h.Id<<8 | uint64(b)
-	}
+	h.Decode(buffer)
 	pkt := make([]byte, headerLen+cfg.MaxPay+2*blkCipher.BlockSize())
 	for {
 		buf := buffer
@@ -78,7 +77,7 @@ func tunRead(tun io.Reader, con io.Writer, cfg *config) {
 
 		h.FragNum = byte((n + cfg.MaxPay - 1) / cfg.MaxPay)
 
-		// Equally fill all h.FragNum packets.
+		// Calculate lengths to equally fill all h.FragNum packets.
 		payLen := (n + int(h.FragNum) - 1) / int(h.FragNum)
 		usedLen := headerLen + payLen
 		pktLen := blkAlignUp(usedLen)
@@ -92,12 +91,12 @@ func tunRead(tun io.Reader, con io.Writer, cfg *config) {
 				pktLen = blkAlignUp(usedLen)
 			}
 			h.Len = uint16(payLen)
-
-			log.Printf("%d\n", h)
 			h.Encode(buf)
 
-			copy(pkt, buf[:usedLen]) // Encrypt here.
+			cipher.NewCBCEncrypter(blkCipher, iv).CryptBlocks(pkt, buf[:pktLen])
+			//copy(pkt, buf[:usedLen]) // Encrypt here.
 
+			atomic.StoreUint32(&active, 1)
 			_, err := con.Write(pkt[:pktLen])
 			if checkNetErr(err) {
 				break
@@ -115,7 +114,7 @@ func tunRead(tun io.Reader, con io.Writer, cfg *config) {
 }*/
 
 type defrag struct {
-	Id    uint64
+	Id    uint32
 	Frags [][]byte
 }
 
@@ -130,10 +129,19 @@ func tunWrite(tun io.Writer, con io.Reader, cfg *config) {
 		n, err := con.Read(buf)
 		checkNetErr(err)
 		switch {
-		case n >= headerLen+20:
-			// Decrypt here.
-
+		case n == 0:
+			// Hello packet
+		case n < headerLen+20:
+			log.Printf("%s: Received packet is to short.", cfg.Dev)
+		case n&blkMask != 0:
+			log.Printf(
+				"%s: Received packet length %d is not multiple of block size %d.",
+				cfg.Dev, n, blkCipher.BlockSize(),
+			)
+		default:
+			cipher.NewCBCDecrypter(blkCipher, iv).CryptBlocks(buf, buf)
 			h.Decode(buf)
+
 			pktLen := blkAlignUp(headerLen + int(h.Len))
 			if n != pktLen {
 				log.Printf("%s: Bad packet size: %d != %d.", cfg.Dev, n, pktLen)
@@ -157,35 +165,35 @@ func tunWrite(tun io.Writer, con io.Reader, cfg *config) {
 					dtab[0] = cur
 				}
 				if len(cur.Frags) != int(h.FragNum) {
-					if cap(cur.Frags) < int(h.FragNum) || h.FragN >= h.FragNum ||
-						len(cur.Frags) != 0 && len(cur.Frags) != int(h.FragNum) {
-
-						log.Printf("%s: Bad header %d", cfg.Dev, h)
+					if len(cur.Frags) != 0 {
+						log.Printf("%s: Header do not match previous fragment.", cfg.Dev)
 						continue
 					}
-					if len(cur.Frags) == 0 {
-						cur.Id = h.Id
-						cur.Frags = cur.Frags[:h.FragNum]
-					}
+					cur.Id = h.Id
+					cur.Frags = cur.Frags[:h.FragNum]
+				}
+				if h.FragN >= h.FragNum {
+					log.Printf("%s: Bad header (FragN >= FragNum).", cfg.Dev)
 				}
 				frag := cur.Frags[h.FragN]
 				if frag == nil {
 					frag = make([]byte, 0, cfg.MaxPay)
 				}
 				frag = frag[:h.Len]
+				cur.Frags[h.FragN] = frag
 				copy(frag, buf[headerLen:])
 				for _, frag = range cur.Frags {
-					if frag == nil {
+					if len(frag) == 0 {
 						// Found lack of fragment.
 						break
 					}
 				}
-				if frag == nil {
+				if len(frag) == 0 {
 					// Lack of some fragment.
 					continue
 				}
 				// All fragments received.
-				n = 0
+				n = headerLen
 				for i, frag := range cur.Frags {
 					n += copy(buf[n:], frag)
 					cur.Frags[i] = frag[:0]
@@ -194,7 +202,7 @@ func tunWrite(tun io.Writer, con io.Reader, cfg *config) {
 				copy(dtab[cn:], dtab[cn+1:])
 				dtab[len(dtab)-1] = cur
 			}
-			_, err := tun.Write(buf[:n])
+			_, err := tun.Write(buf[headerLen:n])
 			if pathErr, ok := err.(*os.PathError); ok &&
 				pathErr.Err == syscall.EINVAL {
 
@@ -202,9 +210,6 @@ func tunWrite(tun io.Writer, con io.Reader, cfg *config) {
 				break
 			}
 			checkErr(err)
-
-		case n > 0:
-			log.Printf("%s: Received packet is to short.", cfg.Dev)
 		}
 	}
 }

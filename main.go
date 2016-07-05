@@ -4,16 +4,21 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"io"
 	"log"
 	"net"
 	"os"
+	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 var (
 	blkCipher cipher.Block
 	blkMask   int
+	iv        []byte
+	active    uint32
 )
 
 func main() {
@@ -34,7 +39,13 @@ func main() {
 
 	blkCipher, err = aes.NewCipher([]byte(cfg.Key))
 	checkErr(err)
-	blkMask = blkCipher.BlockSize() - 1 // BUG?: Assumes that size is power of two.
+	
+	// Header has 32 bit counter with random initial value so use empty
+	// constant initial vector should not be too much harm for CBC.
+	iv = make([]byte, blkCipher.BlockSize()) 
+	
+	// BlockSize must be power of two.
+	blkMask = blkCipher.BlockSize() - 1
 
 	copy(ifr.name[:], cfg.Dev)
 	ifr.flags = IFF_TUN | IFF_NO_PI
@@ -60,6 +71,19 @@ func main() {
 	con, err := net.DialUDP("udp", saddr, daddr)
 	checkErr(err)
 
+	if cfg.Hello > 0 {
+		go hello(con, time.Duration(cfg.Hello)*time.Second)
+	}
 	go tunRead(tun, con, cfg)
 	tunWrite(tun, con, cfg)
+}
+
+func hello(con io.Writer, hello time.Duration) {
+	for {
+		if atomic.SwapUint32(&active, 0) == 0 {
+			_, err := con.Write(nil)
+			checkNetErr(err)
+		}
+		time.Sleep(hello)
+	}
 }

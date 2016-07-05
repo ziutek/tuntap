@@ -16,6 +16,7 @@ type config struct {
 	Dst    string // Destination address
 	MaxPay int    // Maximum payload size.
 	Key    string // 16, 24 or 32 chars
+	Hello  int    // Number of seconds of idle after hello packet is sent.
 }
 
 func readConfig(filename string) (*config, error) {
