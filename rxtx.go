@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/cipher"
 	"crypto/rand"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 func checkNetErr(err error) bool {
@@ -58,14 +60,17 @@ func blkAlignUp(n int) int {
 	return (n + blkMask) &^ blkMask
 }
 
-func tunRead(tun io.Reader, con io.Writer, cfg *config) {
+var active uint32
+
+func senderUDP(tun io.Reader, con *net.UDPConn, cfg *config, raddr *net.UDPAddr, rac <-chan *net.UDPAddr) {
 	buffer := make([]byte, 8192)
 	var h header
 
 	// Initialize h.Id to random number.
-	_, err := rand.Read(buffer[:8])
+	_, err := rand.Read(buffer[:4])
 	checkErr(err)
 	h.Decode(buffer)
+
 	pkt := make([]byte, headerLen+cfg.MaxPay+2*blkCipher.BlockSize())
 	for {
 		buf := buffer
@@ -94,10 +99,20 @@ func tunRead(tun io.Reader, con io.Writer, cfg *config) {
 			h.Encode(buf)
 
 			cipher.NewCBCEncrypter(blkCipher, iv).CryptBlocks(pkt, buf[:pktLen])
-			//copy(pkt, buf[:usedLen]) // Encrypt here.
 
 			atomic.StoreUint32(&active, 1)
-			_, err := con.Write(pkt[:pktLen])
+
+			if rac != nil {
+				select {
+				case raddr = <-rac:
+					log.Printf("%s: Remote address changed to %v.", cfg.Dev, raddr)
+				default:
+				}
+			}
+			if raddr == nil {
+				break
+			}
+			_, err := con.WriteToUDP(pkt[:pktLen], raddr)
 			if checkNetErr(err) {
 				break
 			}
@@ -118,20 +133,33 @@ type defrag struct {
 	Frags [][]byte
 }
 
-func tunWrite(tun io.Writer, con io.Reader, cfg *config) {
+func receiverUDP(tun io.Writer, con *net.UDPConn, cfg *config, rac chan<- *net.UDPAddr) {
 	buf := make([]byte, 8192)
 	dtab := make([]*defrag, 3)
 	for i := range dtab {
 		dtab[i] = &defrag{Frags: make([][]byte, 0, (8192+cfg.MaxPay-1)/cfg.MaxPay)}
 	}
-	var h header
+	var (
+		h   header
+		pra = new(net.UDPAddr)
+	)
 	for {
-		n, err := con.Read(buf)
-		checkNetErr(err)
+		var (
+			n     int
+			err   error
+			raddr *net.UDPAddr
+		)
+		if rac == nil {
+			n, err = con.Read(buf)
+		} else {
+			n, raddr, err = con.ReadFromUDP(buf)
+		}
+		if checkNetErr(err) {
+			continue
+		}
+
 		switch {
-		case n == 0:
-			// Hello packet
-		case n < headerLen+20:
+		case n < headerLen+4:
 			log.Printf("%s: Received packet is to short.", cfg.Dev)
 		case n&blkMask != 0:
 			log.Printf(
@@ -201,15 +229,54 @@ func tunWrite(tun io.Writer, con io.Reader, cfg *config) {
 				cur.Frags = cur.Frags[:0]
 				copy(dtab[cn:], dtab[cn+1:])
 				dtab[len(dtab)-1] = cur
-			}
-			_, err := tun.Write(buf[headerLen:n])
-			if pathErr, ok := err.(*os.PathError); ok &&
-				pathErr.Err == syscall.EINVAL {
-
-				log.Printf("%s: Invalid IP datagram.\n", cfg.Dev)
+			} else if h.FragNum == 0 {
+				// Hello packet.
+				if h.Len != 4 || !bytes.Equal(buf[:4], buf[headerLen:headerLen+4]) {
+					log.Printf("%s: Bad hello packet.", cfg.Dev)
+					continue
+				}
 				break
 			}
-			checkErr(err)
+			_, err = tun.Write(buf[headerLen:n])
+			if err != nil {
+				if pathErr, ok := err.(*os.PathError); ok &&
+					pathErr.Err == syscall.EINVAL {
+
+					log.Printf("%s: Invalid IP datagram.", cfg.Dev)
+					continue
+				}
+				checkErr(err)
+			}
 		}
+		// Received correct Hello packet or TUN/TAP payload.
+		if rac != nil && (!pra.IP.Equal(raddr.IP) || pra.Port != raddr.Port) {
+			// Inform senderUDP about remote address.
+			select {
+			case rac <- raddr:
+				pra = raddr
+			default:
+			}
+		}
+	}
+}
+
+func hello(con *net.UDPConn, raddr *net.UDPAddr, hello time.Duration) {
+	buf := make([]byte, blkAlignUp(headerLen+4))
+	var h header
+	// Initialize h.Id to random number.
+	_, err := rand.Read(buf[:4])
+	checkErr(err)
+	h.Decode(buf)
+	h.Len = 4
+	for {
+		if atomic.SwapUint32(&active, 0) == 0 {
+			h.Encode(buf)
+			copy(buf[headerLen:], buf[:4])
+			cipher.NewCBCEncrypter(blkCipher, iv).CryptBlocks(buf, buf)
+			_, err := con.WriteToUDP(buf, raddr)
+			checkNetErr(err)
+			h.Id++
+		}
+		time.Sleep(hello)
 	}
 }

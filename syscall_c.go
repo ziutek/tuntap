@@ -10,6 +10,7 @@ import "C"
 
 const (
 	IFF_TUN   = C.IFF_TUN
+	IFF_TAP   = C.IFF_TAP
 	IFF_NO_PI = C.IFF_NO_PI
 	TUNSETIFF = C.TUNSETIFF
 )

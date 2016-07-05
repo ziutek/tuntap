@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"io"
 	"log"
 	"net"
 	"os"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -18,12 +16,11 @@ var (
 	blkCipher cipher.Block
 	blkMask   int
 	iv        []byte
-	active    uint32
 )
 
 func main() {
 	if len(os.Args) != 2 {
-		os.Stderr.WriteString("Usage: tun CONFIG_FILE\n")
+		os.Stderr.WriteString("Usage: tuntap CONFIG_FILE\n")
 		os.Exit(1)
 	}
 	cfg, err := readConfig(os.Args[1])
@@ -39,16 +36,20 @@ func main() {
 
 	blkCipher, err = aes.NewCipher([]byte(cfg.Key))
 	checkErr(err)
-	
+
 	// Header has 32 bit counter with random initial value so use empty
 	// constant initial vector should not be too much harm for CBC.
-	iv = make([]byte, blkCipher.BlockSize()) 
-	
+	iv = make([]byte, blkCipher.BlockSize())
+
 	// BlockSize must be power of two.
 	blkMask = blkCipher.BlockSize() - 1
 
 	copy(ifr.name[:], cfg.Dev)
-	ifr.flags = IFF_TUN | IFF_NO_PI
+	if cfg.TAP {
+		ifr.flags = IFF_TAP | IFF_NO_PI
+	} else {
+		ifr.flags = IFF_TUN | IFF_NO_PI
+	}
 
 	_, _, e := syscall.Syscall(
 		syscall.SYS_IOCTL,
@@ -62,28 +63,27 @@ func main() {
 
 	cfg.Dev = string(ifr.name[:bytes.IndexByte(ifr.name[:], 0)])
 
-	log.Printf("Using %s device.", cfg.Dev)
-
-	saddr, err := net.ResolveUDPAddr("udp", cfg.Src)
+	laddr, err := net.ResolveUDPAddr("udp", cfg.Local)
 	checkErr(err)
-	daddr, err := net.ResolveUDPAddr("udp", cfg.Dst)
-	checkErr(err)
-	con, err := net.DialUDP("udp", saddr, daddr)
+	con, err := net.ListenUDP("udp", laddr)
 	checkErr(err)
 
-	if cfg.Hello > 0 {
-		go hello(con, time.Duration(cfg.Hello)*time.Second)
+	var raddr *net.UDPAddr
+	if cfg.Remote != "" {
+		raddr, err = net.ResolveUDPAddr("udp", cfg.Remote)
+		checkErr(err)
 	}
-	go tunRead(tun, con, cfg)
-	tunWrite(tun, con, cfg)
-}
 
-func hello(con io.Writer, hello time.Duration) {
-	for {
-		if atomic.SwapUint32(&active, 0) == 0 {
-			_, err := con.Write(nil)
-			checkNetErr(err)
-		}
-		time.Sleep(hello)
+	log.Printf("%s: Local: %v, remote: %v.", cfg.Dev, con.LocalAddr(), raddr)
+
+	var rac chan *net.UDPAddr
+
+	if raddr == nil {
+		rac = make(chan *net.UDPAddr, 1)
+	} else if cfg.Hello > 0 {
+		go hello(con, raddr, time.Duration(cfg.Hello)*time.Second)
 	}
+
+	go senderUDP(tun, con, cfg, raddr, rac)
+	receiverUDP(tun, con, cfg, rac)
 }
