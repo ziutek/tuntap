@@ -29,13 +29,16 @@ func checkNetErr(err error) bool {
 }
 
 type header struct {
-	Id      uint32 // Schould have a random initial value.
+	Id      uint64 // Schould have a random initial value.
 	FragN   byte
 	FragNum byte
 	Len     uint16
 }
 
-const headerLen = 8
+const (
+	headerLen = 12
+	idLen     = 8
+)
 
 func (h *header) Encode(buf []byte) {
 	id := h.Id
@@ -43,31 +46,38 @@ func (h *header) Encode(buf []byte) {
 	buf[1] = byte(id >> 8)
 	buf[2] = byte(id >> 16)
 	buf[3] = byte(id >> 24)
-	buf[4] = h.FragN
-	buf[5] = h.FragNum
-	buf[6] = byte(h.Len & 0xff)
-	buf[7] = byte(h.Len >> 8)
+	buf[4] = byte(id >> 32)
+	buf[5] = byte(id >> 40)
+	buf[6] = byte(id >> 48)
+	buf[7] = byte(id >> 56)
+	buf[8] = h.FragN
+	buf[9] = h.FragNum
+	buf[10] = byte(h.Len & 0xff)
+	buf[11] = byte(h.Len >> 8)
 }
 
 func (h *header) Decode(buf []byte) {
-	h.Id = uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24
-	h.FragN = buf[4]
-	h.FragNum = buf[5]
-	h.Len = uint16(buf[6]) | uint16(buf[7])<<8
+	h.Id = uint64(buf[0]) | uint64(buf[1])<<8 |
+		uint64(buf[2])<<16 | uint64(buf[5])<<24 |
+		uint64(buf[4])<<32 | uint64(buf[3])<<40 |
+		uint64(buf[6])<<48 | uint64(buf[7])<<56
+	h.FragN = buf[8]
+	h.FragNum = buf[9]
+	h.Len = uint16(buf[10]) | uint16(buf[11])<<8
 }
 
 func blkAlignUp(n int) int {
 	return (n + blkMask) &^ blkMask
 }
 
-var active uint32
+var lastSent int64
 
 func senderUDP(tun io.Reader, con *net.UDPConn, cfg *config, raddr *net.UDPAddr, rac <-chan *net.UDPAddr) {
 	buffer := make([]byte, 8192)
 	var h header
 
 	// Initialize h.Id to random number.
-	_, err := rand.Read(buffer[:4])
+	_, err := rand.Read(buffer[:idLen])
 	checkErr(err)
 	h.Decode(buffer)
 
@@ -100,8 +110,6 @@ func senderUDP(tun io.Reader, con *net.UDPConn, cfg *config, raddr *net.UDPAddr,
 
 			cipher.NewCBCEncrypter(blkCipher, iv).CryptBlocks(pkt, buf[:pktLen])
 
-			atomic.StoreUint32(&active, 1)
-
 			if rac != nil {
 				select {
 				case raddr = <-rac:
@@ -112,6 +120,9 @@ func senderUDP(tun io.Reader, con *net.UDPConn, cfg *config, raddr *net.UDPAddr,
 			if raddr == nil {
 				break
 			}
+
+			atomic.StoreInt64(&lastSent, time.Now().Unix())
+
 			_, err := con.WriteToUDP(pkt[:pktLen], raddr)
 			if checkNetErr(err) {
 				break
@@ -129,7 +140,7 @@ func senderUDP(tun io.Reader, con *net.UDPConn, cfg *config, raddr *net.UDPAddr,
 }*/
 
 type defrag struct {
-	Id    uint32
+	Id    uint64
 	Frags [][]byte
 }
 
@@ -159,7 +170,7 @@ func receiverUDP(tun io.Writer, con *net.UDPConn, cfg *config, rac chan<- *net.U
 		}
 
 		switch {
-		case n < headerLen+4:
+		case n < headerLen+idLen:
 			log.Printf("%s: Received packet is to short.", cfg.Dev)
 		case n&blkMask != 0:
 			log.Printf(
@@ -231,7 +242,9 @@ func receiverUDP(tun io.Writer, con *net.UDPConn, cfg *config, rac chan<- *net.U
 				dtab[len(dtab)-1] = cur
 			} else if h.FragNum == 0 {
 				// Hello packet.
-				if h.Len != 4 || !bytes.Equal(buf[:4], buf[headerLen:headerLen+4]) {
+				if h.Len != idLen ||
+					!bytes.Equal(buf[:idLen], buf[headerLen:headerLen+idLen]) {
+
 					log.Printf("%s: Bad hello packet.", cfg.Dev)
 					continue
 				}
@@ -260,23 +273,29 @@ func receiverUDP(tun io.Writer, con *net.UDPConn, cfg *config, rac chan<- *net.U
 	}
 }
 
-func hello(con *net.UDPConn, raddr *net.UDPAddr, hello time.Duration) {
-	buf := make([]byte, blkAlignUp(headerLen+4))
+func hello(con *net.UDPConn, raddr *net.UDPAddr, hello int64) {
+	buf := make([]byte, blkAlignUp(headerLen+idLen))
 	var h header
 	// Initialize h.Id to random number.
-	_, err := rand.Read(buf[:4])
+	_, err := rand.Read(buf[:idLen])
 	checkErr(err)
 	h.Decode(buf)
-	h.Len = 4
+	h.Len = idLen
 	for {
-		if atomic.SwapUint32(&active, 0) == 0 {
+		last := atomic.LoadInt64(&lastSent)
+		now := time.Now().Unix()
+		idle := now - last
+		wait := hello - idle
+		if wait <= 0 {
 			h.Encode(buf)
-			copy(buf[headerLen:], buf[:4])
+			copy(buf[headerLen:], buf[:idLen])
 			cipher.NewCBCEncrypter(blkCipher, iv).CryptBlocks(buf, buf)
 			_, err := con.WriteToUDP(buf, raddr)
 			checkNetErr(err)
 			h.Id++
+			atomic.StoreInt64(&lastSent, now)
+			wait = hello
 		}
-		time.Sleep(hello)
+		time.Sleep(time.Duration(wait) * time.Second)
 	}
 }

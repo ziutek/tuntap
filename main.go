@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
@@ -37,8 +36,8 @@ func main() {
 	blkCipher, err = aes.NewCipher([]byte(cfg.Key))
 	checkErr(err)
 
-	// Header has 32 bit counter with random initial value so use empty
-	// constant initial vector should not be too much harm for CBC.
+	// Header has 64 bit counter with random initial value so use
+	// constant initial vector (iv) should not be too much harm for CBC.
 	iv = make([]byte, blkCipher.BlockSize())
 
 	// BlockSize must be power of two.
@@ -81,7 +80,7 @@ func main() {
 	if raddr == nil {
 		rac = make(chan *net.UDPAddr, 1)
 	} else if cfg.Hello > 0 {
-		go hello(con, raddr, time.Duration(cfg.Hello)*time.Second)
+		go hello(con, raddr, int64(cfg.Hello))
 	}
 
 	go senderUDP(tun, con, cfg, raddr, rac)
