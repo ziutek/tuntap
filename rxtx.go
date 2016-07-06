@@ -18,10 +18,11 @@ func checkNetErr(err error) bool {
 		return false
 	}
 	if e, ok := err.(*net.OpError); ok {
-		if e, ok := e.Err.(*os.SyscallError); ok &&
-			e.Err == syscall.ECONNREFUSED {
-
-			return true
+		if e, ok := e.Err.(*os.SyscallError); ok {
+			switch e.Err {
+			case syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH:
+				return true
+			}
 		}
 	}
 	log.Fatal("Network error: ", err)
