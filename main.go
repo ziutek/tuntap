@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -80,9 +81,11 @@ func main() {
 	if raddr == nil {
 		rac = make(chan *net.UDPAddr, 1)
 	} else if cfg.Hello > 0 {
-		go hello(con, raddr, int64(cfg.Hello))
+		go hello(con, raddr, time.Duration(cfg.Hello)*time.Second)
 	}
-
+	if cfg.LogDown > 0 {
+		go logUpDown(cfg.Dev, time.Duration(cfg.LogDown)*time.Second)
+	}
 	go senderUDP(tun, con, cfg, raddr, rac)
 	receiverUDP(tun, con, cfg, rac)
 }

@@ -11,13 +11,14 @@ import (
 )
 
 type config struct {
-	Dev    string // Device name.
-	TAP    bool   // true for TAP, false for TUN.
-	Local  string // Local address:port
-	Remote string // Remote address:port
-	MaxPay int    // Maximum payload size.
-	Key    string // 16, 24 or 32 chars
-	Hello  int    // Number of seconds of idle after hello packet is sent.
+	Dev     string // Device name.
+	TAP     bool   // true for TAP, false for TUN.
+	Local   string // Local address:port
+	Remote  string // Remote address:port
+	MaxPay  int    // Maximum payload size.
+	Key     string // 16, 24 or 32 chars
+	Hello   int    // Number of seconds of Tx idle after hello packet is sent.
+	LogDown int    // Nubmer of seconds of Rx idle to log that tunnel is down.
 }
 
 func readConfig(filename string) (*config, error) {

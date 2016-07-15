@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"time"
 )
 
 func checkErr(err error) {
@@ -9,4 +10,10 @@ func checkErr(err error) {
 		return
 	}
 	log.Fatal(err)
+}
+
+var start = time.Now()
+
+func nanosec() int64 {
+	return int64(time.Now().Sub(start))
 }

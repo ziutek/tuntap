@@ -121,9 +121,9 @@ func senderUDP(tun io.Reader, con *net.UDPConn, cfg *config, raddr *net.UDPAddr,
 			if raddr == nil {
 				break
 			}
-
-			atomic.StoreInt64(&lastSent, time.Now().Unix())
-
+			if cfg.Hello > 0 {
+				atomic.StoreInt64(&lastSent, nanosec())
+			}
 			_, err := con.WriteToUDP(pkt[:pktLen], raddr)
 			if checkNetErr(err) {
 				break
@@ -134,16 +134,39 @@ func senderUDP(tun io.Reader, con *net.UDPConn, cfg *config, raddr *net.UDPAddr,
 	}
 }
 
-/*func getMTU(iname string) int {
-	dev, err := net.InterfaceByName(iname)
+func hello(con *net.UDPConn, raddr *net.UDPAddr, hello time.Duration) {
+	buf := make([]byte, blkAlignUp(headerLen+idLen))
+	var h header
+	// Initialize h.Id to random number.
+	_, err := rand.Read(buf[:idLen])
 	checkErr(err)
-	return dev.MTU
-}*/
+	h.Decode(buf)
+	h.Len = idLen
+	for {
+		last := atomic.LoadInt64(&lastSent)
+		now := nanosec()
+		idle := now - last
+		wait := hello - time.Duration(idle)
+		if wait <= 0 {
+			h.Encode(buf)
+			copy(buf[headerLen:], buf[:idLen])
+			cipher.NewCBCEncrypter(blkCipher, iv).CryptBlocks(buf, buf)
+			_, err := con.WriteToUDP(buf, raddr)
+			checkNetErr(err)
+			h.Id++
+			atomic.StoreInt64(&lastSent, now)
+			wait = hello
+		}
+		time.Sleep(wait)
+	}
+}
 
 type defrag struct {
 	Id    uint64
 	Frags [][]byte
 }
+
+var lastRecv int64
 
 func receiverUDP(tun io.Writer, con *net.UDPConn, cfg *config, rac chan<- *net.UDPAddr) {
 	buf := make([]byte, 8192)
@@ -187,6 +210,26 @@ func receiverUDP(tun io.Writer, con *net.UDPConn, cfg *config, rac chan<- *net.U
 				log.Printf("%s: Bad packet size: %d != %d.", cfg.Dev, n, pktLen)
 				continue
 			}
+			if h.FragNum == 0 {
+				// Hello packet.
+				if h.Len != idLen ||
+					!bytes.Equal(buf[:idLen], buf[headerLen:headerLen+idLen]) {
+
+					log.Printf("%s: Bad hello packet.", cfg.Dev)
+					continue
+				}
+				if cfg.LogDown > 0 {
+					atomic.StoreInt64(&lastRecv, nanosec())
+				}
+				break
+			}
+			if h.FragN >= h.FragNum {
+				log.Printf("%s: Bad header (FragN >= FragNum).", cfg.Dev)
+				continue
+			}
+			if cfg.LogDown > 0 {
+				atomic.StoreInt64(&lastRecv, nanosec())
+			}
 			if h.FragNum > 1 {
 				var (
 					cur *defrag
@@ -206,14 +249,14 @@ func receiverUDP(tun io.Writer, con *net.UDPConn, cfg *config, rac chan<- *net.U
 				}
 				if len(cur.Frags) != int(h.FragNum) {
 					if len(cur.Frags) != 0 {
-						log.Printf("%s: Header do not match previous fragment.", cfg.Dev)
+						log.Printf(
+							"%s: Header do not match previous fragment.",
+							cfg.Dev,
+						)
 						continue
 					}
 					cur.Id = h.Id
 					cur.Frags = cur.Frags[:h.FragNum]
-				}
-				if h.FragN >= h.FragNum {
-					log.Printf("%s: Bad header (FragN >= FragNum).", cfg.Dev)
 				}
 				frag := cur.Frags[h.FragN]
 				if frag == nil {
@@ -241,15 +284,6 @@ func receiverUDP(tun io.Writer, con *net.UDPConn, cfg *config, rac chan<- *net.U
 				cur.Frags = cur.Frags[:0]
 				copy(dtab[cn:], dtab[cn+1:])
 				dtab[len(dtab)-1] = cur
-			} else if h.FragNum == 0 {
-				// Hello packet.
-				if h.Len != idLen ||
-					!bytes.Equal(buf[:idLen], buf[headerLen:headerLen+idLen]) {
-
-					log.Printf("%s: Bad hello packet.", cfg.Dev)
-					continue
-				}
-				break
 			}
 			_, err = tun.Write(buf[headerLen:n])
 			if err != nil {
@@ -274,29 +308,26 @@ func receiverUDP(tun io.Writer, con *net.UDPConn, cfg *config, rac chan<- *net.U
 	}
 }
 
-func hello(con *net.UDPConn, raddr *net.UDPAddr, hello int64) {
-	buf := make([]byte, blkAlignUp(headerLen+idLen))
-	var h header
-	// Initialize h.Id to random number.
-	_, err := rand.Read(buf[:idLen])
-	checkErr(err)
-	h.Decode(buf)
-	h.Len = idLen
+func logUpDown(dev string, logDown time.Duration) {
+	atomic.StoreInt64(&lastRecv, nanosec()-int64(logDown))
+	var up bool
 	for {
-		last := atomic.LoadInt64(&lastSent)
-		now := time.Now().Unix()
+		last := atomic.LoadInt64(&lastRecv)
+		now := nanosec()
 		idle := now - last
-		wait := hello - idle
+		wait := logDown - time.Duration(idle)
 		if wait <= 0 {
-			h.Encode(buf)
-			copy(buf[headerLen:], buf[:idLen])
-			cipher.NewCBCEncrypter(blkCipher, iv).CryptBlocks(buf, buf)
-			_, err := con.WriteToUDP(buf, raddr)
-			checkNetErr(err)
-			h.Id++
-			atomic.StoreInt64(&lastSent, now)
-			wait = hello
+			if up {
+				log.Printf("%s: Remote is down.", dev)
+				up = false
+			}
+			wait = logDown / 4
+		} else {
+			if !up {
+				log.Printf("%s: Remote is up.", dev)
+				up = true
+			}
 		}
-		time.Sleep(time.Duration(wait) * time.Second)
+		time.Sleep(wait)
 	}
 }
