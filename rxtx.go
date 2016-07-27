@@ -53,7 +53,7 @@ func (h *header) Encode(buf []byte) {
 	buf[7] = byte(id >> 56)
 	buf[8] = h.FragN
 	buf[9] = h.FragNum
-	buf[10] = byte(h.Len & 0xff)
+	buf[10] = byte(h.Len)
 	buf[11] = byte(h.Len >> 8)
 }
 
