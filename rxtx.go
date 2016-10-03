@@ -90,6 +90,7 @@ func senderUDP(tun io.Reader, con *net.UDPConn, cfg *config, raddr *net.UDPAddr,
 		if n == 0 {
 			continue
 		}
+		buf = buf[:n+headerLen]
 
 		h.FragNum = byte((n + cfg.MaxPay - 1) / cfg.MaxPay)
 
@@ -97,8 +98,6 @@ func senderUDP(tun io.Reader, con *net.UDPConn, cfg *config, raddr *net.UDPAddr,
 		payLen := (n + int(h.FragNum) - 1) / int(h.FragNum)
 		usedLen := headerLen + payLen
 		pktLen := blkAlignUp(usedLen)
-
-		buf = buf[:n+headerLen]
 
 		for h.FragN = 0; h.FragN < h.FragNum; h.FragN++ {
 			if len(buf) < usedLen {
@@ -246,17 +245,14 @@ func receiverUDP(tun io.Writer, con *net.UDPConn, cfg *config, rac chan<- *net.U
 					cur = dtab[len(dtab)-1]
 					copy(dtab[1:], dtab)
 					dtab[0] = cur
-				}
-				if len(cur.Frags) != int(h.FragNum) {
-					if len(cur.Frags) != 0 {
-						log.Printf(
-							"%s: Header do not match previous fragment.",
-							cfg.Dev,
-						)
-						continue
-					}
 					cur.Id = h.Id
 					cur.Frags = cur.Frags[:h.FragNum]
+				} else if len(cur.Frags) != int(h.FragNum) {
+					log.Printf(
+						"%s: Header do not match previous fragment.",
+						cfg.Dev,
+					)
+					continue
 				}
 				frag := cur.Frags[h.FragN]
 				if frag == nil {
